@@ -712,4 +712,172 @@ POST {AGNOST_ENDPOINT}/api/v1/capture-session  X-Org-Id: <org-id>
 POST {AGNOST_ENDPOINT}/api/v1/capture-event    X-Org-Id: <org-id>
 ```
 
-This is the ingest path used by `scripts/send-demo.mjs`.
+This is the ingest path used by `scripts/send-demo.mjs`, and the route
+`detect.mjs` returns as `direct-ingest` for Rust, Swift and Go apps. It is what
+the Conversation SDKs send underneath, so the data model is the same.
+
+An app that exports OpenTelemetry **logs** but no spans has no usable OTel
+route: Agnost reads spans. Use direct ingest rather than adding a tracer only
+to rename log records.
+
+### capture-session
+
+One per conversation, sent before that conversation's first event.
+
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `session_id` | UUID string | yes | reused on every event of the conversation |
+| `user_data.user_id` | string | yes | stable pseudonymous id; other string traits optional |
+| `metadata` | string → string | no | session-level values such as app version |
+| `timestamp` | int64 ms | no | when the conversation began |
+| `client_config` | string | no | client label such as `my-app/1.4.0` |
+
+### capture-event
+
+One per user-to-agent turn, and one per tool call inside it.
+
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `event_id` | UUID string | yes | client-generated; tool calls point at it |
+| `session_id` | UUID string | yes | from capture-session |
+| `primitive_name` | string | yes | agent name (turn) or tool name (tool call) |
+| `args` | string | yes | user input, or JSON-encoded tool arguments |
+| `result` | string | yes | agent reply, or JSON-encoded tool result |
+| `success` | bool | no | defaults to true |
+| `latency` | int ms | no | |
+| `timestamp` | int64 ms | no | when it happened; set it when events are queued |
+| `parent_id` | UUID string | no | on a tool call: the `event_id` of its turn |
+| `metadata` | string → string | no | model, token counts, error kind |
+
+Several assistant messages in one turn are concatenated into one `result`.
+Generate the turn's `event_id` before its tools run so each tool call can carry
+it as `parent_id`. Ids that are not UUIDs (a numeric run counter, a hex key) map
+to a UUID deterministically, so a retry lands on the same session.
+
+### Rules for native apps
+
+- Send from a background worker fed by a bounded queue; drop when full. Never
+  block a request, a UI thread or an audio path on the network.
+- A network error or a 4xx costs the event, never the user's action.
+- Create no client when `AGNOST_ORG_ID` is absent or not a UUID.
+- Input and output capture stays on by default; when the app already has a
+  content or diagnostics setting that governs what text leaves the device,
+  gate `args`/`result` on it and keep sending names, success, latency and
+  metadata.
+
+### Rust
+
+`tokio`, `reqwest`, `serde_json`, `uuid` (`v4`):
+
+```rust
+use serde_json::{json, Value};
+use tokio::sync::mpsc;
+use uuid::Uuid;
+
+#[derive(Clone)]
+pub struct Agnost(mpsc::Sender<(&'static str, Value)>);
+
+impl Agnost {
+    pub fn from_env() -> Option<Self> {
+        let org = std::env::var("AGNOST_ORG_ID").ok().filter(|o| Uuid::parse_str(o).is_ok())?;
+        let base = std::env::var("AGNOST_ENDPOINT").unwrap_or_else(|_| "https://api.agnost.ai".into());
+        let (tx, mut rx) = mpsc::channel::<(&'static str, Value)>(512);
+        tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            while let Some((path, body)) = rx.recv().await {
+                let _ = client
+                    .post(format!("{base}/api/v1/{path}"))
+                    .header("x-org-id", &org)
+                    .header("content-type", "application/json")
+                    .body(body.to_string())
+                    .send()
+                    .await;
+            }
+        });
+        Some(Self(tx))
+    }
+
+    pub fn session(&self, session: Uuid, user_id: &str) {
+        let _ = self.0.try_send(("capture-session", json!({
+            "session_id": session.to_string(),
+            "user_data": { "user_id": user_id },
+        })));
+    }
+
+    pub fn event(&self, session: Uuid, name: &str, args: &str, result: &str,
+                 success: bool, latency_ms: u64, parent: Option<Uuid>) -> Uuid {
+        let id = Uuid::new_v4();
+        let mut body = json!({
+            "event_id": id.to_string(), "session_id": session.to_string(),
+            "primitive_name": name, "args": args, "result": result,
+            "success": success, "latency": latency_ms,
+        });
+        if let Some(parent) = parent {
+            body["parent_id"] = parent.to_string().into();
+        }
+        let _ = self.0.try_send(("capture-event", body));
+        id
+    }
+}
+```
+
+Construct once inside the runtime. Call `session` when a conversation starts,
+`event` for the turn, then `event` with `Some(turn)` for each tool call. One
+worker sends in order, so the session reaches ingest before its events.
+
+### Swift
+
+Foundation only:
+
+```swift
+import Foundation
+
+actor Agnost {
+    static let shared: Agnost? = {
+        let env = ProcessInfo.processInfo.environment
+        guard let org = env["AGNOST_ORG_ID"], UUID(uuidString: org) != nil,
+              let base = URL(string: env["AGNOST_ENDPOINT"] ?? "https://api.agnost.ai") else { return nil }
+        return Agnost(org: org, base: base)
+    }()
+
+    private let org: String
+    private let base: URL
+
+    init(org: String, base: URL) {
+        self.org = org
+        self.base = base
+    }
+
+    func session(_ session: UUID, userID: String) async {
+        await post("capture-session", ["session_id": session.uuidString.lowercased(),
+                                       "user_data": ["user_id": userID]])
+    }
+
+    func event(_ session: UUID, name: String, args: String, result: String,
+               success: Bool, latencyMs: Int, parent: UUID? = nil) async -> UUID {
+        let id = UUID()
+        var body: [String: Any] = ["event_id": id.uuidString.lowercased(),
+                                   "session_id": session.uuidString.lowercased(),
+                                   "primitive_name": name, "args": args, "result": result,
+                                   "success": success, "latency": latencyMs]
+        if let parent { body["parent_id"] = parent.uuidString.lowercased() }
+        await post("capture-event", body)
+        return id
+    }
+
+    private func post(_ path: String, _ body: [String: Any]) async {
+        guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }
+        var request = URLRequest(url: base.appendingPathComponent("api/v1/\(path)"))
+        request.httpMethod = "POST"
+        request.setValue(org, forHTTPHeaderField: "x-org-id")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = data
+        _ = try? await URLSession.shared.data(for: request)
+    }
+}
+```
+
+Call it from a detached `Task`, never from the main actor's critical path, and
+await `session` before the conversation's first `event`. A shipped app reads the
+org id from its own configuration (Info.plist or remote config); the
+environment variable is for development.

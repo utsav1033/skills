@@ -75,7 +75,37 @@ function classify() {
     return rec("conversation-py", "python", "ingest", "Generic Python app via the `agnost` Conversation SDK");
   }
 
-  fail("no supported Node/TypeScript or Python project found");
+  const native = nativeProject(dir);
+  if (native) {
+    if (strategy === "otel") {
+      fail(`no Agnost OTel recipe for ${native.language}; if the app already exports OTel spans (not only logs), follow references/frameworks.md#custom-otel-spans, otherwise rerun with --strategy sdk for direct ingest`);
+    }
+    return rec(
+      "direct-ingest",
+      native.language,
+      "ingest",
+      `${native.label} app with no Agnost SDK: post capture-session and capture-event from the real agent/tool path (references/frameworks.md#direct-ingest-fallback)`
+    );
+  }
+
+  fail("no supported Node/TypeScript, Python, Rust, Swift or Go project found");
+}
+
+function nativeProject(root) {
+  if (existsSync(join(root, "Cargo.toml"))) return { language: "rust", label: "Rust" };
+  if (existsSync(join(root, "Package.swift")) || hasEntry(root, /\.(xcodeproj|xcworkspace)$/)) {
+    return { language: "swift", label: "Swift" };
+  }
+  if (existsSync(join(root, "go.mod"))) return { language: "go", label: "Go" };
+  return null;
+}
+
+function hasEntry(root, pattern) {
+  try {
+    return readdirSync(root).some((name) => pattern.test(name));
+  } catch {
+    return false;
+  }
 }
 
 function rec(framework, language, transport, reason) {

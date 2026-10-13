@@ -163,6 +163,12 @@ if (framework === "mcp-ts") {
   ]);
   configureLangSmithPythonEnv();
   result.warnings.push("langchain-py dependency/env added; enable LangSmith OTel mode before importing or constructing LangChain objects");
+} else if (framework === "direct-ingest") {
+  configureEnv({
+    AGNOST_ORG_ID: orgId,
+    AGNOST_ENDPOINT: endpointsFor(mode).ingest,
+  });
+  result.warnings.push("direct-ingest env added; write the capture-session/capture-event client at the real agent and tool path by hand (references/frameworks.md#direct-ingest-fallback)");
 } else {
   fail(`framework '${framework}' is not in the public automation slice yet`);
 }
@@ -925,6 +931,7 @@ function referenceFor(name) {
     "spectrum-ts": "references/frameworks.md#spectrum-ts-app-level-otel-spans",
     "langchain-ts": "references/frameworks.md#langchain-langsmith-otel-mode",
     "langchain-py": "references/frameworks.md#langchain-langsmith-otel-mode",
+    "direct-ingest": "references/frameworks.md#direct-ingest-fallback",
   }[name] || "references/frameworks.md";
 }
 
